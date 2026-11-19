@@ -55,5 +55,19 @@ class KeypairTest(unittest.TestCase):
             self.assertEqual(os.stat(path).st_mtime_ns, before)
 
 
+class SshCommandTest(unittest.TestCase):
+    def test_default_port_uses_no_pty(self):
+        self.assertEqual(
+            u.ssh_command("/tmp/key", "192.168.1.1"),
+            "ssh -T -i /tmp/key root@192.168.1.1",
+        )
+
+    def test_custom_port_uses_no_pty(self):
+        self.assertEqual(
+            u.ssh_command("/tmp/key", "192.168.1.1", 2222),
+            "ssh -T -i /tmp/key -p 2222 root@192.168.1.1",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -101,7 +101,7 @@ python3 ung220z.py -i 192.168.1.1 -u user -p '你的密码' --ssh-uninstall
 最后输出凭据汇总表，并写入 `ung220z_<时间戳>.log`。如果 SSH 安装成功，汇总表里会多一行：
 
 ```
-SSH (仅密钥)           ssh -i /home/you/.ssh/ung220z_192.168.1.1_rsa root@192.168.1.1
+SSH (仅密钥)           ssh -T -i /home/you/.ssh/ung220z_192.168.1.1_rsa root@192.168.1.1
 ```
 
 ## SSH（默认安装）
@@ -118,10 +118,16 @@ SSH (仅密钥)           ssh -i /home/you/.ssh/ung220z_192.168.1.1_rsa root@192
 连接：
 
 ```bash
-ssh -i ~/.ssh/ung220z_192.168.1.1_rsa root@192.168.1.1
+ssh -T -i ~/.ssh/ung220z_192.168.1.1_rsa root@192.168.1.1
 # 改过端口：
-ssh -i ~/.ssh/ung220z_192.168.1.1_rsa -p 2222 root@192.168.1.1
+ssh -T -i ~/.ssh/ung220z_192.168.1.1_rsa -p 2222 root@192.168.1.1
 ```
+
+> **PTY 兼容性**：该固件的 devpts/PTY 路径不完整，直接 `ssh ...`（申请 PTY）会报
+> `PTY allocation request failed` / `shell request failed`。请使用上面的 `ssh -T`
+> （不申请 PTY）：单条命令、管道 shell 和 `scp` 都可用；`tty` 会显示 `not a tty`。
+> 需要完整交互式终端时，用 Telnet（`CMCCAdmin` → `su`）。`ssh -T` 登录时可能看到
+> 一行无害的 `ln: /lib/libjli.so: File exists`。
 
 第一次连接会提示未知主机密钥。确认地址无误后接受即可；也可以先用
 `ssh-keyscan -p 22 192.168.1.1` 查看指纹，再用

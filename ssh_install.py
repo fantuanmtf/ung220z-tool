@@ -348,6 +348,8 @@ def uninstall_ssh(tn, port=SSH_DEFAULT_PORT, lan_if="br0", log=print):
 
 
 def ssh_command(priv, ip, port=SSH_DEFAULT_PORT):
+    # 该固件的 devpts/PTY 路径不兼容，-T 走无 PTY 通道；
+    # 单条命令、管道 shell 和 scp 都可用，完整交互式终端请用 Telnet。
     if int(port) == 22:
-        return "ssh -i %s root@%s" % (shlex.quote(priv), ip)
-    return "ssh -i %s -p %d root@%s" % (shlex.quote(priv), int(port), ip)
+        return "ssh -T -i %s root@%s" % (shlex.quote(priv), ip)
+    return "ssh -T -i %s -p %d root@%s" % (shlex.quote(priv), int(port), ip)
