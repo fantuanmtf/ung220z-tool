@@ -30,10 +30,19 @@ import webbrowser
 
 IAC, DONT, DO, WONT, WILL, SB, SE = 255, 254, 253, 252, 251, 250, 240
 TELNET_USER = "CMCCAdmin"
-TELNET_PW = ""   # 留空则只用你输入的密码尝试，或用 --telnet-password 指定
+# 中国移动 / ZTE 系光猫的出厂 Telnet 与 root 口令。Telnet 账号独立于 Web 账号，
+# telnet.gch 只负责开端口，不会把 Web 密码同步成 Telnet 密码。
+TELNET_DEFAULT_PW = "aDm8H%MdA"
 CFG_ENC = "/userconfig/cfg/db_user_cfg.xml"
 CFG_DEC = "/tmp/debug-decry-cfg"
 PLACEHOLDER_PSK = "!@#$%12345"
+
+ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+# 登录后的提示符：csp 为 "~ $"，root 为 "/ #"（不同固件前缀可能不同）
+PROMPT_RE = re.compile(r"(?:^|\n)[^\n<>\"']{0,48}[#$][ \t]*$")
+ROOT_PROMPT_RE = re.compile(r"(?:^|\n)[^\n<>\"']{0,48}#[ \t]*$")
+# 行首的提示符前缀，如 "/ # "、"~ $ "
+PROMPT_PREFIX_RE = re.compile(r"^\s*(?:~|/)[^\s]*\s+[$#]\s+")
 
 _logfh = None
 
@@ -170,7 +179,7 @@ def _parse(buf):
             continue
         out.append(b)
         i += 1
-    return bytes(out).decode("utf-8", "replace"), bytes(rep)
+    return ANSI_RE.sub("", bytes(out).decode("utf-8", "replace")), bytes(rep)
 
 
 class Telnet:
@@ -178,6 +187,7 @@ class Telnet:
         self.s = socket.create_connection((ip, port), timeout=timeout)
         self.s.setblocking(False)
         self.buf = ""
+        self.account = None
 
     def _recv(self, timeout):
         r, _, _ = select.select([self.s], [], [], timeout)
@@ -215,37 +225,75 @@ class Telnet:
     def send(self, line):
         self.s.sendall(line.encode() + b"\r\n")
 
-    def login(self, user, passwords):
+    def login(self, accounts):
+        """accounts 为 [(用户名, 口令), ...]，按顺序尝试。"""
         self.read_until("Login:", 8)
-        for pw in passwords:
+        for user, pw in accounts:
             self.buf = ""
             self.send(user)
-            got = self.read_until_any(["Password:", "incorrect"], 8)
+            got = self.read_until_any(["Password:", "incorrect", "Login:"], 8)
             if got != "Password:":
                 log("AUTH", "Telnet 用户名 %s 不可用" % user)
-                return False
+                continue
             self.buf = ""
             self.send(pw)
-            got = self.read_until_any(["/ #", "incorrect", "Login:"], 8)
-            if got == "/ #":
-                log("AUTH", "Telnet %s / %s → 登录成功（root）" % (user, pw))
+            if self._wait_shell(8) == "ok":
+                self.account = (user, pw)
+                kind = "root" if ROOT_PROMPT_RE.search(self.buf) else "csp"
+                log("AUTH", "Telnet %s / %s → 登录成功（%s）" % (user, pw, kind))
                 return True
             log("AUTH", "Telnet %s / %s → refused" % (user, pw))
+            if "Login:" not in self.buf:
+                self.read_until("Login:", 5)
         return False
 
+    def _wait_shell(self, timeout=8, root=False):
+        """等待 shell 提示符；返回 ok / fail / timeout。"""
+        rx = ROOT_PROMPT_RE if root else PROMPT_RE
+        end = time.time() + timeout
+        while time.time() < end:
+            if rx.search(self.buf):
+                return "ok"
+            if "incorrect" in self.buf or "Login:" in self.buf:
+                return "fail"
+            self._recv(0.3)
+        return "timeout"
+
+    def escalate_root(self, passwords):
+        """在 csp shell 中 su 到 root；成功返回所用口令，失败返回 None。"""
+        self.buf = ""
+        self.send("id")
+        self.read_until_any(["$", "#"], 4)
+        if "uid=0(root)" in self.buf:
+            return ""
+        for pw in passwords:
+            self.buf = ""
+            self.send("su")
+            if "Password:" not in self.read_until("Password:", 5):
+                continue
+            self.buf = ""
+            self.send(pw)
+            if self._wait_shell(6, root=True) == "ok":
+                log("AUTH", "su → root 成功（口令 %s）" % pw)
+                return pw
+            log("AUTH", "su 口令 %s → 失败" % pw)
+            self.read_until_any(["~ $", "$ "], 3)
+        return None
+
     def run(self, cmd, timeout=15):
+        # 标记拆成 __X__''END：回显里不会出现连续的 __X__END，只有真正的输出才是
         self.buf = ""
         self.send(cmd)
-        time.sleep(0.35)
-        self.send("echo __X__")
-        out = self.read_until("__X__", timeout).split("__X__")[0]
+        self.send("echo __X__''END")
+        out = self.read_until("__X__END", timeout).split("__X__END")[0]
         lines = []
         for ln in out.splitlines():
+            ln = PROMPT_PREFIX_RE.sub("", ln).rstrip()
             s = ln.strip()
-            if not s or s.startswith("/ #") or s == "echo":
+            if not s or PROMPT_RE.fullmatch(s) or "__X__''END" in s:
                 continue
-            lines.append(ln.rstrip())
-        if lines and cmd[:24] in lines[0]:
+            lines.append(ln)
+        if lines and lines[0].strip() == cmd.strip():
             lines = lines[1:]
         return "\n".join(lines).strip()
 
@@ -348,13 +396,28 @@ def main():
         return 3
 
     tn = Telnet(ip)
-    cands = [x for x in (TELNET_PW, getattr(a, "telnet_password", None)) if x]
-    if pw not in cands:
-        cands.append(pw)
-    if not tn.login(a.telnet_user, cands):
-        log("WARN", "Telnet 登录失败，终止")
+    accounts = []
+    if a.telnet_password:
+        accounts.append((a.telnet_user, a.telnet_password))
+    accounts += [
+        (TELNET_USER, TELNET_DEFAULT_PW),   # CMCC / ZTE 出厂默认
+        (a.telnet_user, pw),                # 与 Web 口令相同的情况
+        (user, pw),                         # 普通 Web 账户
+    ]
+    seen = set()
+    accounts = [x for x in accounts if not (x in seen or seen.add(x))]
+    if not tn.login(accounts):
+        log("WARN", "Telnet 登录失败（已试 %d 组账号），可用 --telnet-user / --telnet-password 指定" % len(accounts))
         tn.close()
         return 4
+
+    # Telnet 登录后通常是 csp 用户（提示符 ~ $），需要 su 到 root
+    creds, wifi = {}, []
+    root_pw = tn.escalate_root([TELNET_DEFAULT_PW, pw, "admin", "root"])
+    if root_pw is None:
+        log("WARN", "未能 su 到 root，继续以 csp 权限尝试")
+    elif root_pw:
+        creds["root"] = ("root", root_pw)
 
     if a.unlock or web_state(ip) == "busy":
         st = web_state(ip)
@@ -373,7 +436,6 @@ def main():
         return 5
     log("SHELL", "sidbg 1 DB decry %s → %s" % (CFG_ENC, CFG_DEC))
 
-    creds, wifi = {}, []
     for r in parse_rows(grab_table(tn, "DevAuthInfo")):
         lvl = r.get("Level")
         log("DATA", "DevAuthInfo  %-10s / %-18s  Level=%s" % (r.get("User"), r.get("Pass"), lvl))
@@ -381,11 +443,14 @@ def main():
 
     for r in parse_rows(grab_table(tn, "TelnetUser")):
         log("DATA", "TelnetUser   %-10s / %-18s  Type=%s" % (r.get("Username"), r.get("Password"), r.get("Type")))
+        if "telnet" not in creds and r.get("Username"):
+            creds["telnet"] = (r["Username"], r.get("Password"))
 
     ts_pw = grab_scalar(tn, "TS_UPwd")
     if ts_pw:
-        log("DATA", "TS_UPwd      %s / %s（实际 Telnet 口令）" % (TELNET_USER, ts_pw))
-        creds["telnet"] = (TELNET_USER, ts_pw)
+        log("DATA", "TS_UPwd      %s / %s（Telnet 服务口令）" % (TELNET_USER, ts_pw))
+        creds.setdefault("telnet", (TELNET_USER, ts_pw))
+    creds.setdefault("telnet", tn.account)
 
     for r in parse_rows(grab_table(tn, "WANCPPP")):
         if r.get("UserName"):
@@ -408,21 +473,23 @@ def main():
 
     shadow = tn.run("grep root /etc/shadow | head -1")
     m = re.search(r"root:(\$[0-9]\$[^:]+):", shadow)
-    if m:
-        root_pw = crack_root(m.group(1), ["aDm8H%MdA", "admin", "root", "123456", "CMCCAdmin"])
+    if m and "root" not in creds:
+        root_pw = crack_root(m.group(1), [TELNET_DEFAULT_PW, "admin", "root", "123456", "CMCCAdmin"])
         if root_pw:
             log("CRACK", "MATCH: %s  (/etc/shadow)" % root_pw)
             creds["root"] = ("root", root_pw)
         else:
             log("DATA", "root 哈希 %s…（常见口令未命中）" % m.group(1)[:32])
             creds["root"] = ("root", m.group(1))
+    elif "root" in creds:
+        log("CRACK", "root 口令已由 su 验证：%s" % creds["root"][1])
     tn.close()
 
     # ── 汇总 ──
     print("\n" + "═" * 66)
     print(" 凭据汇总    %s" % ip)
     print("═" * 66)
-    labels = [("telnet", "Telnet / root shell"), ("web_admin", "Web 超管"),
+    labels = [("telnet", "Telnet (csp)"), ("web_admin", "Web 超管"),
               ("web_user", "Web 普通用户"), ("pppoe", "PPPoE 宽带"), ("root", "Linux root")]
     for key, lab in labels:
         if key in creds:

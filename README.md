@@ -16,7 +16,7 @@
    ↓
 拼出 http://<ip>/usr=<user>&psw=<pass>&cmd=1&telnet.gch 并打开浏览器（同时脚本直连兜底）
    ↓
-Telnet 登录 → root shell
+Telnet 登录（csp）→ su 提权到 root shell
    ↓
 sidbg 1 DB decry /userconfig/cfg/db_user_cfg.xml 解密配置
    ↓
@@ -58,7 +58,7 @@ python3 ung220z.py -i 192.168.1.1 -u user -p '你的密码' --no-browser
 | `-u, --user` | 登录用户名，默认 `user` |
 | `-p, --password` | 登录密码，不填则交互输入 |
 | `--telnet-user` | Telnet 用户名，默认 `CMCCAdmin` |
-| `--telnet-password` | Telnet 口令（部分机型与 Web 口令不同） |
+| `--telnet-password` | Telnet 口令；不填会自动尝试出厂口令与 Web 口令 |
 | `--no-browser` | 不调用浏览器，纯 HTTP 请求 |
 | `--unlock` | Web 被会话锁占住时重启 httpd 解锁 |
 | `--no-release` | 不尝试释放残留 Web 会话 |
@@ -70,7 +70,8 @@ python3 ung220z.py -i 192.168.1.1 -u user -p '你的密码' --no-browser
 [22:15:00] HTTP   已发送给浏览器: http://192.168.1.1/usr=user&psw=***&cmd=1&telnet.gch
 [22:15:00] HTTP   telnet.gch → TelnetSet Success!
 [22:15:00] PROBE  nc -zv 192.168.1.1 23 → succeeded
-[22:15:01] AUTH   Telnet CMCCAdmin / ****** → 登录成功（root）
+[22:15:01] AUTH   Telnet CMCCAdmin / ****** → 登录成功（csp）
+[22:15:01] AUTH   su → root 成功（口令 ******）
 [22:15:02] SHELL  sidbg 1 DB decry /userconfig/cfg/db_user_cfg.xml → /tmp/debug-decry-cfg
 [22:15:03] DATA   DevAuthInfo  CMCCAdmin  / ******  Level=1
 [22:15:04] CRACK  MATCH: ******  (/etc/shadow)
@@ -88,8 +89,9 @@ python3 ung220z.py -i 192.168.1.1 -u user -p '你的密码' --no-browser
 
 | 环节 | 说明 |
 |---|---|
-| 开 Telnet | `GET /usr=<user>&psw=<pass>&cmd=1&telnet.gch`，返回 `TelnetSet Success!` 即成功 |
-| Web 登录 | 密码前端只做 base64，`Frm_Logintoken` 每次响应递增，必须回填实时值 |
+| 开 Telnet | `GET /usr=<user>&psw=<pass>&cmd=1&telnet.gch`，返回 `TelnetSet Success!` 即成功；该接口只开端口，**不会**把 Web 密码同步成 Telnet 密码 |
+| Telnet 登录 | 账号独立于 Web 账号；国内移动/ZTE 系出厂为 `CMCCAdmin` / `aDm8H%MdA`，登录后是 `csp` 用户（提示符 `~ $`） |
+| 提权 | `su` + root 口令（同为出厂 `aDm8H%MdA`）拿到 `/ #`；工具会自动尝试并识别两种提示符 |
 | 配置解密 | `sidbg 1 DB decry` 无口令即可解密，得到明文 XML |
 | root 口令 | `/etc/shadow` 中为 SHA-256 crypt，工具会用常见出厂口令比对 |
 
