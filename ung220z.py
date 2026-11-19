@@ -8,11 +8,14 @@ ung220z.py —— UNG220Z / Unionman 中国移动网关 凭据提取工具
   2. 补全 http://<ip>/usr=<user>&psw=<pass>&cmd=1&telnet.gch 并发送给浏览器，开启 Telnet
   3. 走 Telnet 通道登录（全程不建立 Web 会话，避免把管理页锁死）
   4. 解密配置库，提取全部凭据
-  5. 按 [HH:MM:SS] TAG 格式打印日志，并落盘
+  5. 默认安装仅密钥、仅内网、开机自启的 dropbear；--no-ssh 可关闭
+  6. 按 [HH:MM:SS] TAG 格式打印日志，并落盘
 
 用法
   python3 ung220z.py
   python3 ung220z.py -i 192.168.1.1 -u user -p 'xxxx' --no-browser
+  python3 ung220z.py -i 192.168.1.1 -u user -p 'xxxx' --no-browser --no-ssh
+  python3 ung220z.py -i 192.168.1.1 -u user -p 'xxxx' --ssh-uninstall
 """
 import argparse
 import getpass
@@ -28,6 +31,10 @@ import urllib.parse
 import urllib.request
 import webbrowser
 
+from ssh_install import (SSH_DEFAULT_PORT, build_boot_hook_script,
+                         build_start_ssh_script, ensure_ssh_keypair,
+                         install_ssh, ssh_command, uninstall_ssh)
+
 IAC, DONT, DO, WONT, WILL, SB, SE = 255, 254, 253, 252, 251, 250, 240
 TELNET_USER = "CMCCAdmin"
 # 中国移动 / ZTE 系光猫的出厂 Telnet 与 root 口令。Telnet 账号独立于 Web 账号，
@@ -41,8 +48,8 @@ ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 # 登录后的提示符：csp 为 "~ $"，root 为 "/ #"（不同固件前缀可能不同）
 PROMPT_RE = re.compile(r"(?:^|\n)[^\n<>\"']{0,48}[#$][ \t]*$")
 ROOT_PROMPT_RE = re.compile(r"(?:^|\n)[^\n<>\"']{0,48}#[ \t]*$")
-# 行首的提示符前缀，如 "/ # "、"~ $ "
-PROMPT_PREFIX_RE = re.compile(r"^\s*(?:~|/)[^\s]*\s+[$#]\s+")
+# 行首的提示符前缀，如 "/ # "、"~ $ "，以及退化成裸 "# " 的情况
+PROMPT_PREFIX_RE = re.compile(r"^\s*(?:(?:~|/)[^\s]*\s+)?[$#]\s+")
 
 _logfh = None
 
@@ -132,31 +139,41 @@ def unlock_web(ip, tn):
 
 
 def enable_telnet(ip, user, pw, open_browser=True):
+    """开 Telnet。先试 ZTE 出厂口令，再回退到用户给的 Web 口令。"""
     base = "http://%s/" % ip
-    raw = "%susr=%s&psw=%s&cmd=1&telnet.gch" % (base, user, pw)
-    variants = [
-        raw,
-        "%susr=%s&psw=%s&cmd=1&telnet.gch" % (base, urllib.parse.quote(user),
-                                              urllib.parse.quote(pw, safe="")),
-        "%s?usr=%s&psw=%s&cmd=1&telnet.gch" % (base, user, urllib.parse.quote(pw, safe="")),
-    ]
-    if open_browser:
-        try:
-            opened = webbrowser.open(raw)
-            log("HTTP", "已发送给浏览器%s: %s" % ("" if opened else "（无可用浏览器，改由脚本直连）", raw))
-        except Exception as e:
-            log("WARN", "浏览器调用失败: %s" % e)
-    for url in variants:
-        try:
-            body = http_get(url)
-        except Exception as e:
-            log("WARN", "telnet.gch 请求失败: %s" % e)
-            continue
-        if "Success" in body:
-            log("HTTP", "telnet.gch → TelnetSet Success!")
-            return True
-        txt = re.sub(r"<[^>]+>", " ", body).strip()
-        log("HTTP", "telnet.gch → %s" % (txt[:60] if txt else "空响应"))
+    pairs = [(TELNET_USER, TELNET_DEFAULT_PW), (user, pw)]
+    seen = set()
+    pairs = [x for x in pairs if not (x in seen or seen.add(x))]
+    last_msg = "空响应"
+    for u, p in pairs:
+        raw = "%susr=%s&psw=%s&cmd=1&telnet.gch" % (base, u, p)
+        variants = [
+            raw,
+            "%susr=%s&psw=%s&cmd=1&telnet.gch" % (base, urllib.parse.quote(u),
+                                                  urllib.parse.quote(p, safe="")),
+            "%s?usr=%s&psw=%s&cmd=1&telnet.gch" % (base, u,
+                                                   urllib.parse.quote(p, safe="")),
+        ]
+        if open_browser and u == TELNET_USER:
+            try:
+                opened = webbrowser.open(raw)
+                log("HTTP", "已发送给浏览器%s: %s"
+                    % ("" if opened else "（无可用浏览器，改由脚本直连）", raw))
+            except Exception as e:
+                log("WARN", "浏览器调用失败: %s" % e)
+        for url in variants:
+            try:
+                body = http_get(url)
+            except Exception as e:
+                log("WARN", "telnet.gch 请求失败: %s" % e)
+                continue
+            if "Success" in body:
+                log("HTTP", "telnet.gch → TelnetSet Success!（账号 %s）" % u)
+                return True
+            txt = re.sub(r"<[^>]+>", " ", body).strip()
+            last_msg = txt[:60] if txt else "空响应"
+            log("HTTP", "telnet.gch（%s）→ %s" % (u, last_msg))
+    log("HTTP", "telnet.gch 全部尝试失败：%s" % last_msg)
     return False
 
 
@@ -204,6 +221,22 @@ class Telnet:
             self.s.sendall(rep)
         self.buf += txt
         return True
+
+    def _drain(self):
+        """丢弃上一条命令遗留在 socket 里的提示符/尾随输出。"""
+        while True:
+            r, _, _ = select.select([self.s], [], [], 0)
+            if not r:
+                return
+            try:
+                data = self.s.recv(8192)
+            except BlockingIOError:
+                return
+            if not data:
+                return
+            _, rep = _parse(data)
+            if rep:
+                self.s.sendall(rep)
 
     def read_until(self, token, timeout=10):
         end = time.time() + timeout
@@ -282,6 +315,7 @@ class Telnet:
 
     def run(self, cmd, timeout=15):
         # 标记拆成 __X__''END：回显里不会出现连续的 __X__END，只有真正的输出才是
+        self._drain()
         self.buf = ""
         self.send(cmd)
         self.send("echo __X__''END")
@@ -292,8 +326,11 @@ class Telnet:
             s = ln.strip()
             if not s or PROMPT_RE.fullmatch(s) or "__X__''END" in s:
                 continue
+            if "__X__END" in s and s.startswith(("echo ", "printf ")):
+                continue
             lines.append(ln)
-        if lines and lines[0].strip() == cmd.strip():
+        if lines and (lines[0].strip() == cmd.strip()
+                      or lines[0].strip().endswith(cmd.strip())):
             lines = lines[1:]
         return "\n".join(lines).strip()
 
@@ -348,7 +385,17 @@ def main():
     ap.add_argument("--telnet-user", default=TELNET_USER, help="Telnet 用户名，默认 CMCCAdmin")
     ap.add_argument("--telnet-password", default=None, help="Telnet 口令（部分机型与 Web 口令不同）")
     ap.add_argument("--unlock", action="store_true", help="Web 被会话锁占住时，重启 httpd 解锁")
+    ap.add_argument("--no-ssh", action="store_true", help="不安装 SSH（默认安装仅密钥的 dropbear）")
+    ap.add_argument("--ssh-port", type=int, default=SSH_DEFAULT_PORT, help="SSH 端口，默认 22")
+    ap.add_argument("--ssh-key", default=None,
+                    help="已有 SSH 私钥路径；默认生成 ~/.ssh/ung220z_<ip>_rsa")
+    ap.add_argument("--ssh-uninstall", action="store_true", help="卸载 SSH 服务和开机自启")
+    ap.add_argument("--host-ip", default=None, help="本机 LAN IP（上传 SSH 文件用），默认自动检测")
+    ap.add_argument("--ssh-lan-if", default="br0", help="LAN 接口，默认 br0")
     a = ap.parse_args()
+    if not 1 <= a.ssh_port <= 65535:
+        log("WARN", "SSH 端口无效：%s" % a.ssh_port)
+        return 1
 
     logfile = "ung220z_%s.log" % time.strftime("%Y%m%d_%H%M%S")
     _logfh = open(logfile, "w", encoding="utf-8")
@@ -387,7 +434,7 @@ def main():
     if not a.no_release:
         log("INFO", "释放残留 Web 会话 → %s" % ("ok" if release_session(ip) else "skip"))
 
-    log("INFO", "补全 URL: http://%s/usr=%s&psw=***&cmd=1&telnet.gch" % (ip, user))
+    log("INFO", "telnet.gch：先试默认账号 %s，再回退 %s" % (TELNET_USER, user))
     enable_telnet(ip, user, pw, open_browser=not a.no_browser)
 
     log("PROBE", "nc -zv %s 23 → %s" % (ip, "succeeded" if probe_port(ip, 23) else "timed out"))
@@ -418,6 +465,13 @@ def main():
         log("WARN", "未能 su 到 root，继续以 csp 权限尝试")
     elif root_pw:
         creds["root"] = ("root", root_pw)
+
+    if a.ssh_uninstall:
+        ok = uninstall_ssh(tn, port=a.ssh_port, lan_if=a.ssh_lan_if, log=log)
+        tn.close()
+        if _logfh:
+            _logfh.close()
+        return 0 if ok else 6
 
     if a.unlock or web_state(ip) == "busy":
         st = web_state(ip)
@@ -483,6 +537,11 @@ def main():
             creds["root"] = ("root", m.group(1))
     elif "root" in creds:
         log("CRACK", "root 口令已由 su 验证：%s" % creds["root"][1])
+
+    ssh_result = None
+    if not a.no_ssh:
+        ssh_result = install_ssh(tn, ip, port=a.ssh_port, key_path=a.ssh_key,
+                                 host_ip=a.host_ip, lan_if=a.ssh_lan_if, log=log)
     tn.close()
 
     # ── 汇总 ──
@@ -498,7 +557,19 @@ def main():
     for ssid, psk in wifi:
         note = "  (出厂占位)" if psk == PLACEHOLDER_PSK else ""
         print("  %s %s %s%s" % (pad("WiFi " + ssid, 22), pad("", 14), psk, note))
+    if ssh_result is not None:
+        if ssh_result.get("ok"):
+            print("  %s %s" % (pad("SSH (仅密钥)", 22),
+                               ssh_result.get("command", "")))
+            if not ssh_result.get("verified"):
+                print("  %s %s" % (pad("", 22),
+                                   "服务已启动；宿主机 ssh 验证未通过，请手动试"))
+        else:
+            print("  %s %s" % (pad("SSH", 22),
+                               "安装失败: %s" % ssh_result.get("error", "未知错误")))
     print("═" * 66)
+    if ssh_result and ssh_result.get("ok"):
+        log("INFO", "SSH 已安装：%s" % ssh_result["command"])
     log("INFO", "完成。口令每 15 分钟轮换，重跑本脚本即可取新值")
     if _logfh:
         _logfh.close()

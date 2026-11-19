@@ -2,3 +2,4 @@
 __pycache__/
 *.pyc
 ung220z_*.log
+ssh/.build/

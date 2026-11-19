@@ -11,6 +11,7 @@ import os
 import socket
 import sys
 import threading
+import time
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -34,6 +35,7 @@ class FakeDevice(threading.Thread):
         self.username = None
         self.state = "login_user"
         self.root = False
+        self.pending_stale = False
         self._stop = threading.Event()
 
     def _prompt(self):
@@ -86,7 +88,15 @@ class FakeDevice(threading.Thread):
                     f.write(b"\r\nPassword: ")
                     self.state = "su_pw"
                 elif line == "echo __X__''END":
-                    f.write(b"\r\n__X__END\r\n" + self._prompt().encode())
+                    f.write(b"\r\n__X__END\r\n")
+                    if self.pending_stale:
+                        # 模拟上一轮 run() 在标记后遗留的输出
+                        f.write(b"STALE\r\n")
+                        self.pending_stale = False
+                    f.write(self._prompt().encode())
+                elif line == "bare":
+                    # 某些状态下提示符会变成裸 "# "，并与命令回显拼在一起
+                    f.write(b"\r\n# bare\r\nbare-output\r\n" + self._prompt().encode())
                 elif line == "id":
                     uid = "uid=0(root) gid=0(root)" if self.root else "uid=108(csp) gid=110(csp)"
                     f.write(("\r\n%s\r\n" % uid).encode() + self._prompt().encode())
@@ -129,6 +139,24 @@ class TelnetCompatTest(unittest.TestCase):
         self.assertNotIn("\x1b[", out)
         self.assertNotIn("~ $", out)
         self.assertNotIn("/ #", out)
+
+    def test_run_strips_bare_hash_prompt_echo(self):
+        """root 提示符可能退化成裸 '# '，不能把 '# bare' 当成输出。"""
+        self.assertTrue(self.tn.login([("CMCCAdmin", TELNET_PW)]))
+        self.tn.escalate_root([TELNET_PW])
+        out = self.tn.run("bare")
+        self.assertEqual(out, "bare-output")
+
+    def test_run_drains_stale_output(self):
+        """上一条命令在标记后遗留的输出不能污染下一条命令。"""
+        self.assertTrue(self.tn.login([("CMCCAdmin", TELNET_PW)]))
+        self.tn.escalate_root([TELNET_PW])
+        self.dev.pending_stale = True
+        self.tn.run("id")
+        time.sleep(0.2)
+        out = self.tn.run("id")
+        self.assertIn("uid=0(root)", out)
+        self.assertNotIn("STALE", out)
 
 
 if __name__ == "__main__":
